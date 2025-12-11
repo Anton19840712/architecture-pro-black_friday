@@ -54,13 +54,9 @@ sh.shardCollection("somedb.orders", { "user_id": "hashed" })
   product_id: String,         // Уникальный идентификатор товара
   name: String,               // Наименование
   category: String,           // Категория: "electronics", "audio", "appliances"
+  geo_zone: String,           // Геозона доступности: "msk", "spb", "ekb", "kln"
   price: Number,              // Цена
-  stock: {                    // Остатки по геозонам
-    msk: Number,
-    spb: Number,
-    ekb: Number,
-    kln: Number
-  },
+  stock: Number,              // Остаток товара в данной геозоне
   attributes: {               // Дополнительные атрибуты
     color: String,
     size: String
@@ -68,17 +64,32 @@ sh.shardCollection("somedb.orders", { "user_id": "hashed" })
 }
 ```
 
-**Выбор шард-ключа:** `{ category: 1, product_id: "hashed" }`
+**Выбор шард-ключа:** `{ geo_zone: 1, category: 1, product_id: "hashed" }`
 
 **Обоснование:**
-- Составной ключ: category для range-запросов по категориям + product_id hashed для распределения
-- Поиск товаров по категориям эффективен (targeted к группе шардов)
-- Hashed product_id предотвращает hot spots внутри категории
-- Частые обновления остатков распределяются равномерно
+- **geo_zone** — пользователи ищут товары в своём регионе, запросы локализуются на конкретные шарды
+- **category** — внутри региона поиск по категориям эффективен (targeted queries)
+- **product_id hashed** — равномерное распределение внутри гео+категории, предотвращает hot spots
+- Типичный запрос `{ geo_zone: "msk", category: "electronics" }` попадает на один шард
+- Обновления остатков (`stock`) локализованы в рамках геозоны
+- Шарды можно привязать к физическим датацентрам в соответствующих регионах (zone sharding)
 
 **Команда создания:**
 ```javascript
-sh.shardCollection("somedb.products", { "category": 1, "product_id": "hashed" })
+sh.shardCollection("somedb.products", { "geo_zone": 1, "category": 1, "product_id": "hashed" })
+```
+
+**Zone Sharding для гео-локализации:**
+```javascript
+// Привязка шардов к геозонам для минимизации latency
+sh.addShardTag("shard1_rs", "msk")
+sh.addShardTag("shard2_rs", "spb")
+sh.addShardTag("shard3_rs", "ekb")
+
+sh.addTagRange("somedb.products", { geo_zone: "msk", category: MinKey, product_id: MinKey },
+                                   { geo_zone: "msk", category: MaxKey, product_id: MaxKey }, "msk")
+sh.addTagRange("somedb.products", { geo_zone: "spb", category: MinKey, product_id: MinKey },
+                                   { geo_zone: "spb", category: MaxKey, product_id: MaxKey }, "spb")
 ```
 
 ---
@@ -154,7 +165,7 @@ db.getSiblingDB("config").chunks.aggregate([
 ```javascript
 // Переместить чанк на другой шард
 sh.moveChunk("somedb.products",
-  { category: "electronics", product_id: MinKey },
+  { geo_zone: "msk", category: "electronics", product_id: MinKey },
   "shard2_rs"
 )
 ```
@@ -174,23 +185,24 @@ db.settings.update(
 
 **3. Добавление зон (Zone Sharding):**
 ```javascript
-// Создать зону для горячей категории
-sh.addShardTag("shard1_rs", "electronics_zone")
-sh.addShardTag("shard2_rs", "electronics_zone")
+// Создать зону для горячей категории в конкретном регионе
+sh.addShardTag("shard1_rs", "msk_electronics")
+sh.addShardTag("shard2_rs", "msk_electronics")
 
-// Привязать диапазон к зоне (распределить на 2 шарда)
+// Привязать диапазон к зоне (распределить горячую категорию на 2 шарда)
 sh.addTagRange(
   "somedb.products",
-  { category: "electronics", product_id: MinKey },
-  { category: "electronics", product_id: MaxKey },
-  "electronics_zone"
+  { geo_zone: "msk", category: "electronics", product_id: MinKey },
+  { geo_zone: "msk", category: "electronics", product_id: MaxKey },
+  "msk_electronics"
 )
 ```
 
 **4. Разделение горячей категории:**
 ```javascript
-// Изменить шард-ключ на более гранулярный
+// Добавить подкатегорию для более гранулярного распределения
 sh.shardCollection("somedb.products_v2", {
+  "geo_zone": 1,
   "category": 1,
   "subcategory": 1,
   "product_id": "hashed"
